@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="/analytics">Analytics Families</a></li>
+    <li class="breadcrumb-item active">{{ family }}</li>
+  </ol>
+</nav>
+<h2 class="mb-3">{{ family }}</h2>
+
+{% if index_families %}
+<h5 class="mb-2">By Index Family</h5>
+<p class="text-muted small">Each row is one logical index aggregated across all year-partitions of this table family.</p>
+<div class="table-responsive mb-5">
+  <table id="family-table" class="table table-sm table-hover table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th data-sort="str">Index Family <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Partitions <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Total Size <span class="sort-icon">▼</span></th>
+        <th data-sort="num" class="text-end">Total Scans <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Dead Partitions <span class="sort-icon"></span></th>
+        <th data-sort="str">Status <span class="sort-icon"></span></th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in index_families %}
+      <tr>
+        <td><code>{{ row.index_family }}</code></td>
+        <td class="text-end" data-value="{{ row.partition_count }}">{{ row.partition_count }}</td>
+        <td class="text-end" data-value="{{ row.total_size_bytes or 0 }}">{{ row.total_size_bytes | format_bytes }}</td>
+        <td class="text-end" data-value="{{ row.total_scans }}">{{ row.total_scans | format_number }}</td>
+        <td class="text-end" data-value="{{ row.dead_partition_count }}">{{ row.dead_partition_count }} / {{ row.partition_count }}</td>
+        <td data-value="{{ '0' if row.fully_dead else '1' }}">
+          {% if row.fully_dead %}
+            <span class="badge bg-danger">fully dead</span>
+          {% elif row.dead_partition_count > 0 %}
+            <span class="badge bg-warning text-dark">partially dead</span>
+          {% else %}
+            <span class="badge bg-success">active</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<script>
+(function () {
+  var table = document.getElementById('family-table');
+  var tbody = table.querySelector('tbody');
+  var headers = Array.from(table.querySelectorAll('thead th[data-sort]'));
+  var sortCol = 2, sortDir = 'desc';
+
+  function applySort(col, dir) {
+    var rows = Array.from(tbody.querySelectorAll('tr'));
+    var isNum = headers[col].dataset.sort === 'num';
+    rows.sort(function (a, b) {
+      var av = a.cells[col].dataset.value !== undefined ? a.cells[col].dataset.value : a.cells[col].textContent.trim();
+      var bv = b.cells[col].dataset.value !== undefined ? b.cells[col].dataset.value : b.cells[col].textContent.trim();
+      var cmp = isNum ? Number(av) - Number(bv) : av.localeCompare(bv);
+      return dir === 'asc' ? cmp : -cmp;
+    });
+    rows.forEach(function (r) { tbody.appendChild(r); });
+    headers.forEach(function (h) { h.querySelector('.sort-icon').textContent = ''; });
+    headers[col].querySelector('.sort-icon').textContent = dir === 'asc' ? '▲' : '▼';
+  }
+
+  headers.forEach(function (th, i) {
+    th.style.cursor = 'pointer';
+    th.style.userSelect = 'none';
+    th.addEventListener('click', function () {
+      if (sortCol === i) { sortDir = sortDir === 'asc' ? 'desc' : 'asc'; }
+      else { sortCol = i; sortDir = 'desc'; }
+      applySort(sortCol, sortDir);
+    });
+  });
+})();
+</script>
+{% endif %}
+
+{% if indexes %}
+<h5 class="mb-2">By Partition</h5>
+<p class="text-muted small">{{ indexes | length }} individual partition index(es)</p>
+<div class="table-responsive">
+  <table id="index-table" class="table table-sm table-hover table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th data-sort="str">Table (Partition) <span class="sort-icon"></span></th>
+        <th data-sort="str">Index <span class="sort-icon"></span></th>
+        <th data-sort="num">Band <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Scans <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Median &Delta; <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Size <span class="sort-icon">▼</span></th>
+        <th data-sort="num" class="text-end">Snapshots <span class="sort-icon"></span></th>
+        <th data-sort="num">Reset? <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Cardinality <span class="sort-icon"></span></th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in indexes %}
+      {% set band_class = {
+          'dead': 'danger',
+          'low': 'warning',
+          'medium': 'info',
+          'high': 'success',
+          'very_high': 'primary'
+      }[row.band] %}
+      {% set band_rank = {'dead': 0, 'low': 1, 'medium': 2, 'high': 3, 'very_high': 4}[row.band] %}
+      <tr>
+        <td>{{ row.relname }}</td>
+        <td><code>{{ row.indexrelname }}</code></td>
+        <td data-value="{{ band_rank }}"><span class="badge bg-{{ band_class }}">{{ row.band | replace('_', ' ') }}</span></td>
+        <td class="text-end" data-value="{{ row.idx_scan }}">{{ row.idx_scan | format_number }}</td>
+        <td class="text-end" data-value="{{ row.median_delta }}">{{ row.median_delta | format_number }}</td>
+        <td class="text-end" data-value="{{ row.index_size_bytes or 0 }}">{{ row.index_size_bytes | format_bytes }}</td>
+        <td class="text-end" data-value="{{ row.snapshots }}">{{ row.snapshots }}</td>
+        <td data-value="{{ '1' if row.had_reset else '0' }}">{% if row.had_reset %}<span class="badge bg-warning text-dark">Yes</span>{% else %}—{% endif %}</td>
+        <td class="text-end" data-value="{{ row.cardinality_sort }}">
+          {% if row.cardinality_sort < 999999999 %}
+            <span class="{% if row.cardinality_sort <= 50 %}text-warning fw-bold{% endif %}">{{ row.cardinality }}</span>
+          {% else %}
+            <span class="text-muted">{{ row.cardinality }}</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<script>
+(function () {
+  var table = document.getElementById('index-table');
+  var tbody = table.querySelector('tbody');
+  var headers = Array.from(table.querySelectorAll('thead th[data-sort]'));
+  var sortCol = 5, sortDir = 'desc';
+
+  function applySort(col, dir) {
+    var rows = Array.from(tbody.querySelectorAll('tr'));
+    var isNum = headers[col].dataset.sort === 'num';
+    rows.sort(function (a, b) {
+      var av = a.cells[col].dataset.value !== undefined ? a.cells[col].dataset.value : a.cells[col].textContent.trim();
+      var bv = b.cells[col].dataset.value !== undefined ? b.cells[col].dataset.value : b.cells[col].textContent.trim();
+      var cmp = isNum ? Number(av) - Number(bv) : av.localeCompare(bv);
+      return dir === 'asc' ? cmp : -cmp;
+    });
+    rows.forEach(function (r) { tbody.appendChild(r); });
+    headers.forEach(function (h) { h.querySelector('.sort-icon').textContent = ''; });
+    headers[col].querySelector('.sort-icon').textContent = dir === 'asc' ? '▲' : '▼';
+  }
+
+  headers.forEach(function (th, i) {
+    th.style.cursor = 'pointer';
+    th.style.userSelect = 'none';
+    th.addEventListener('click', function () {
+      if (sortCol === i) { sortDir = sortDir === 'asc' ? 'desc' : 'asc'; }
+      else { sortCol = i; sortDir = i === 5 ? 'desc' : 'asc'; }
+      applySort(sortCol, sortDir);
+    });
+  });
+})();
+</script>
+{% else %}
+<p class="text-muted">No indexes found for family <strong>{{ family }}</strong>.</p>
+{% endif %}
+{% endblock %}

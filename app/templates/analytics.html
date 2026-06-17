@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-3">Analytics Families</h2>
+<p class="text-muted small">Sorted by total scans ascending — least-used families first.</p>
+
+{% if families %}
+<div class="table-responsive">
+  <table class="table table-sm table-hover table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th>Family</th>
+        <th class="text-end">Partitions</th>
+        <th class="text-end">Total Scans</th>
+        <th class="text-end">Total Size</th>
+        <th class="text-end">Dead Partitions</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for f in families %}
+      <tr {% if f.fully_dead %}class="table-danger"{% endif %}>
+        <td><a href="/analytics/{{ f.family }}">{{ f.family }}</a></td>
+        <td class="text-end">{{ f.partition_count }}</td>
+        <td class="text-end">{{ f.total_scans | format_number }}</td>
+        <td class="text-end">{{ f.total_size_bytes | format_bytes }}</td>
+        <td class="text-end">{{ f.dead_partition_count }}</td>
+        <td>
+          {% if f.fully_dead %}
+            <span class="badge bg-danger">All dead</span>
+          {% elif f.dead_partition_count > 0 %}
+            <span class="badge bg-warning text-dark">Partial</span>
+          {% else %}
+            <span class="badge bg-success">Active</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="text-muted">No analytics families found.</p>
+{% endif %}
+{% endblock %}

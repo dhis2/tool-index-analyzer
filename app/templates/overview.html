@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-3">Overview</h2>
+
+{% if stats.had_reset %}
+<div class="alert alert-warning">
+  <strong>Stats reset detected.</strong> A PostgreSQL statistics reset occurred in the recorded history.
+  Historical data before the most recent reset is excluded from all metrics.
+</div>
+{% endif %}
+
+<div class="row g-3 mb-4">
+  <div class="col-md-3">
+    <div class="card h-100">
+      <div class="card-body">
+        <h6 class="card-subtitle mb-1 text-muted">Total Indexes</h6>
+        <p class="display-6 mb-0">{{ stats.total_indexes | format_number }}</p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card h-100 border-danger">
+      <div class="card-body">
+        <h6 class="card-subtitle mb-1 text-muted">Dead Indexes</h6>
+        <p class="display-6 mb-0 text-danger">{{ stats.dead_count | format_number }}</p>
+        <small class="text-muted">zero scans, ≥3 snapshots</small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card h-100">
+      <div class="card-body">
+        <h6 class="card-subtitle mb-1 text-muted">Analytics Families</h6>
+        <p class="display-6 mb-0">{{ stats.analytics_family_count | format_number }}</p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card h-100 border-warning">
+      <div class="card-body">
+        <h6 class="card-subtitle mb-1 text-muted">Dead Analytics Indexes</h6>
+        <p class="display-6 mb-0 text-warning">{{ stats.dead_analytics_count | format_number }}</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="text-muted small">
+  Current stats window since: <strong>{{ stats.current_reset.strftime('%Y-%m-%d %H:%M UTC') }}</strong>
+  &nbsp;|&nbsp;
+  Latest snapshot: <strong>{{ stats.latest_snapshot.strftime('%Y-%m-%d %H:%M UTC') }}</strong>
+</p>
+{% endblock %}

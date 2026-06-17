@@ -1,0 +1,14 @@
+[Unit]
+Description=DHIS2 Index Analyzer
+After=network.target
+
+[Service]
+User=dhis2
+WorkingDirectory=/opt/tool-index-analyzer
+EnvironmentFile=/opt/tool-index-analyzer/.env
+ExecStart=/opt/tool-index-analyzer/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
