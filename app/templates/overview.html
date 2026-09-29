@@ -5,7 +5,7 @@
 {% if stats.had_reset %}
 <div class="alert alert-warning">
   <strong>Stats reset detected.</strong> A PostgreSQL statistics reset occurred in the recorded history.
-  Historical data before the most recent reset is excluded from all metrics.
+  Scan counts are accumulated across resets (and across analytics table rebuilds), so this does not affect the metrics.
 </div>
 {% endif %}
 
@@ -46,7 +46,7 @@
 </div>
 
 <p class="text-muted small">
-  Current stats window since: <strong>{{ stats.current_reset.strftime('%Y-%m-%d %H:%M UTC') }}</strong>
+  Latest stats reset: <strong>{{ stats.current_reset.strftime('%Y-%m-%d %H:%M UTC') }}</strong>
   &nbsp;|&nbsp;
   Latest snapshot: <strong>{{ stats.latest_snapshot.strftime('%Y-%m-%d %H:%M UTC') }}</strong>
 </p>

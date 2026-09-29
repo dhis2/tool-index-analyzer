@@ -44,19 +44,16 @@ Routes → queries → templates. There is no ORM, no model layer, no service la
 
 The data source is `_index_usage_daily`, populated twice daily by an external cron job snapshotting `pg_stat_user_indexes`. Key columns: `snapshot_at`, `stats_reset`, `relname` (table), `indexrelname` (index), `indexrelid` (stable OID), `idx_scan` (cumulative), `index_size_bytes`, `index_columns` (index definition minus names, e.g. `btree (uidlevel4)`; NULL for rows before 2026-09-29).
 
-**Analytics indexes are recreated on every analytics run** with a new `indexrelid` and a randomly suffixed `indexrelname` (on DHIS2 2.43 the name also omits the column). So per-`indexrelid` metrics only cover the time since the last rebuild; following a logical index across rebuilds requires grouping on (table family, `index_columns`). The current queries still key on `indexrelid` and need reworking for this.
+**Analytics indexes are recreated on every analytics run** with a new `indexrelid` and a randomly suffixed `indexrelname` (on DHIS2 2.41+ the name also omits the column, DHIS2-22186). Per-`indexrelid` counters therefore only cover the time since the last rebuild.
 
-Critical invariants the queries depend on:
+How `queries.py` handles this:
 
-- **`idx_scan` is cumulative, not a rate**, and resets to 0 whenever Postgres stats are reset. The "current stats window" = rows where `stats_reset = MAX(stats_reset)`. All primary metrics are computed within this window only.
-- **Dead index** = `idx_scan = 0` in the current window AND `snapshots >= 3`. Fewer than 3 snapshots → classified **"insufficient data"** (shown separately), never dead. The `>= 3` guard avoids flagging newly-created indexes.
-- **Usage bands**: dead=0, low=1–999, medium=1,000–9,999, high=10,000–99,999, very_high=100,000+. The valid set is enforced in `get_all_indexes` (`_VALID_BANDS`) — keep it in sync with the `CASE` expression and the `all_bands` list in `main.py`.
-- **Analytics family extraction**: `regexp_replace(relname, '_[0-9]+$', '')` strips a trailing numeric partition suffix (`analytics_2021` → `analytics`). Used everywhere analytics tables are grouped.
-
-### Two query-writing conventions that will bite you
-
-1. **`LIKE 'analytics%'` must be written `LIKE 'analytics%%'`** in these SQL strings, because psycopg2 treats `%` as a parameter placeholder. A single `%` will raise at execute time.
-2. Every query starts from a shared **`_BOUNDS_CTE`** that computes `latest_snap` / `current_reset` in one pass. Queries then seek rows via `snapshot_at = latest_snap` rather than `DISTINCT ON` over the full table — this is a deliberate performance choice (index seek over ~119k rows vs. a scan of ~545k). Follow this pattern for new queries.
+- **Logical index** = (schema, table, `index_key`). For analytics tables `index_key` is the indexed column(s): from `index_columns` (quotes and the `btree (...)` wrapper stripped) or, for rows before 2026-09-29, parsed from the 2.40-style name `in_<column>_ax_...` (with `_lower` -> `lower(col)`, `_desc` -> `col DESC NULLS LAST`, `dx_co`/`dx_ao` -> `dx, co`/`dx, ao`, matching what `pg_get_indexdef` gives). For other tables it is the index name, which is stable.
+- **Scans are accumulated across all stats resets and rebuilds**: per `indexrelid`, the first observation counts in full and each later snapshot adds the increase, or the whole counter if it went down (reset). There is no "current stats window" any more.
+- **Dead** = 0 accumulated scans AND >= 3 snapshots; fewer snapshots is "insufficient data".
+- Only logical indexes present in the **latest snapshot** are reported, so indexes that were dropped or are no longer built (e.g. `analytics.table.skip_index`) disappear.
+- **Performance**: one `_SUMMARY_SQL` builds all logical-index rows. It walks the `(indexrelid, snapshot_at DESC)` index with `LEAD()` so the full history (~7.6M rows on ASC) is never sorted; ~25 s cold at that scale. The result is cached per latest `snapshot_at` and refreshed by a background thread in `main.py`; the page functions only filter/aggregate the cached rows in Python. Do not add per-page SQL over the full history. `avg_delta` is a mean per snapshot interval; an exact median would need the full sort this design avoids.
+- `LIKE 'analytics%%'`: psycopg2 treats `%` as a placeholder when parameters are passed; keep `%%` in SQL that may be executed with parameters.
 
 ## Deployment
 

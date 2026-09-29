@@ -47,7 +47,7 @@ def test_get_all_indexes_returns_list_of_dicts():
     assert isinstance(rows, list)
     assert len(rows) > 0
     for key in ("schemaname", "relname", "indexrelname", "idx_scan",
-                "median_delta", "index_size_bytes", "snapshots", "band"):
+                "avg_delta", "index_size_bytes", "snapshots", "band"):
         assert key in rows[0], f"missing key: {key}"
 
 
@@ -89,7 +89,7 @@ def test_get_analytics_family_detail_returns_rows():
     assert isinstance(rows, list)
     assert len(rows) > 0
     for key in ("schemaname", "relname", "indexrelname", "idx_scan",
-                "median_delta", "index_size_bytes", "snapshots", "band", "had_reset"):
+                "avg_delta", "index_size_bytes", "snapshots", "band", "had_reset"):
         assert key in rows[0], f"missing key: {key}"
 
 

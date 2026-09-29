@@ -1,3 +1,6 @@
+import logging
+import threading
+import time
 from pathlib import Path
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse
@@ -8,6 +11,24 @@ import app.queries as queries
 
 app = FastAPI(title="DHIS2 Index Analyzer")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+_REFRESH_SECONDS = 300
+
+
+def _refresh_summary_forever() -> None:
+    # The summary is expensive to compute but only changes when a snapshot is
+    # taken; recompute it in the background so page loads hit the cache.
+    while True:
+        try:
+            queries.get_overview_stats()
+        except Exception:
+            logging.exception("index summary refresh failed")
+        time.sleep(_REFRESH_SECONDS)
+
+
+@app.on_event("startup")
+def _start_refresher() -> None:
+    threading.Thread(target=_refresh_summary_forever, daemon=True).start()
 
 
 def _format_bytes(n: int | None) -> str:

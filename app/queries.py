@@ -1,97 +1,184 @@
+import re
+import threading
+
 from app.db import get_connection
 
-# All queries use a `bounds` CTE to get latest_snap and current_reset in one
-# pass, then look up the most-recent-per-index row via snapshot_at = latest_snap
-# (index seek, ~119k rows) rather than DISTINCT ON over the full 545k-row table.
+# DHIS2 drops and recreates every analytics index on each analytics run, with a
+# new indexrelid and a randomly suffixed name, so per-indexrelid counters only
+# cover the time since the last rebuild. A *logical* index is therefore keyed on
+# (schema, table, index_key):
+#
+#   - analytics tables: the indexed column(s), taken from index_columns (the
+#     index definition minus names, recorded since 2026-09-29) or, for older
+#     rows, parsed from the 2.40-style name in_<column>_ax_<table>_<code>
+#     (plus the _lower / _desc suffixes of the derived indexes);
+#   - all other tables: the index name, which is stable.
+#
+# Scans are accumulated across every stats reset and every rebuild: for each
+# physical index (indexrelid) the first observation counts in full, and each
+# later snapshot adds the increase since the previous one, or the whole counter
+# if it went down (a stats reset). avg_delta is the mean increase per snapshot
+# interval (an exact median would need a full sort of the history).
+#
+# Only indexes present in the latest snapshot are reported, so dropped or no
+# longer created indexes (e.g. excluded via analytics.table.skip_index) disappear.
+#
+# The summary scans the whole history table, but the data only changes when a
+# snapshot is taken, so it is computed once per latest snapshot and cached; the
+# page functions below filter and aggregate the cached rows.
 
-_BOUNDS_CTE = """
-bounds AS (
-    SELECT
-        MAX(snapshot_at)                  AS latest_snap,
-        MAX(stats_reset)                  AS current_reset,
-        COUNT(DISTINCT stats_reset) > 1   AS had_reset_flag
+_NAME_COLUMN = "regexp_replace(substring(indexrelname from '^in_(.+)_ax_'), '^dx_(co|ao)$', 'dx, \\1')"
+
+# Window over the (indexrelid, snapshot_at DESC) index so no sort of the full
+# history is needed: LEAD() is the previous snapshot of the same physical index.
+_SUMMARY_SQL = f"""
+WITH bounds AS (SELECT MAX(snapshot_at) AS latest_snap FROM _index_usage_daily),
+obs AS (
+    SELECT indexrelid, snapshot_at, idx_scan, stats_reset, schemaname, relname, indexrelname,
+           index_columns, index_size_bytes,
+           LEAD(idx_scan) OVER w AS prev_scan
     FROM _index_usage_daily
+    WINDOW w AS (PARTITION BY indexrelid ORDER BY snapshot_at DESC)
+),
+per_oid AS (
+    SELECT indexrelid,
+           MIN(schemaname)    AS schemaname,
+           MIN(relname)       AS relname,
+           MIN(indexrelname)  AS indexrelname,
+           MAX(index_columns) AS index_columns,
+           SUM(CASE WHEN prev_scan IS NULL OR idx_scan < prev_scan THEN idx_scan
+                    ELSE idx_scan - prev_scan END)                           AS scans,
+           SUM(CASE WHEN prev_scan IS NULL THEN 0
+                    WHEN idx_scan < prev_scan THEN idx_scan
+                    ELSE idx_scan - prev_scan END)                           AS later_scans,
+           COUNT(*)                                                          AS obs,
+           BOOL_OR(idx_scan < prev_scan)                                     AS had_reset,
+           MIN(snapshot_at)                                                  AS first_seen,
+           MAX(snapshot_at)                                                  AS last_seen,
+           MAX(index_size_bytes) FILTER (WHERE snapshot_at = (SELECT latest_snap FROM bounds)) AS latest_size,
+           MAX(stats_reset)                                                  AS stats_reset
+    FROM obs
+    GROUP BY indexrelid
+),
+keyed AS (
+    SELECT p.*,
+        CASE
+            WHEN relname NOT LIKE 'analytics%%' THEN indexrelname
+            WHEN index_columns IS NOT NULL THEN
+                replace(regexp_replace(index_columns, '^\\w+ \\((.*)\\)$', '\\1'), '"', '')
+            WHEN indexrelname ~ '^in_.+_ax_' THEN
+                CASE
+                    WHEN indexrelname LIKE '%%\\_lower' THEN 'lower(' || {_NAME_COLUMN} || ')'
+                    WHEN indexrelname LIKE '%%\\_desc' THEN {_NAME_COLUMN} || ' DESC NULLS LAST'
+                    ELSE {_NAME_COLUMN}
+                END
+            ELSE indexrelname
+        END AS index_key
+    FROM per_oid p
 )
+SELECT
+    schemaname,
+    relname,
+    index_key,
+    MAX(indexrelname) FILTER (WHERE latest_size IS NOT NULL)   AS indexrelname,
+    MAX(latest_size)                                           AS index_size_bytes,
+    MAX(stats_reset)                                           AS stats_reset,
+    SUM(scans)::bigint                                         AS idx_scan,
+    COALESCE(SUM(later_scans) / NULLIF(SUM(obs) - COUNT(*), 0), 0)::bigint AS avg_delta,
+    SUM(obs)                                                   AS snapshots,
+    COUNT(*)                                                   AS rebuilds,
+    COALESCE(BOOL_OR(had_reset), false)                        AS had_reset,
+    MIN(first_seen)                                            AS first_seen
+FROM keyed
+GROUP BY schemaname, relname, index_key
+HAVING MAX(last_seen) = (SELECT latest_snap FROM bounds)
 """
+
+_BOUNDS_SQL = """
+SELECT
+    MAX(snapshot_at)                AS latest_snapshot,
+    MAX(stats_reset)                AS current_reset,
+    COUNT(DISTINCT stats_reset) > 1 AS had_reset
+FROM _index_usage_daily
+"""
+
+_LATEST_SQL = "SELECT MAX(snapshot_at) AS latest FROM _index_usage_daily"
+
+_MIN_SNAPSHOTS = 3
+
+_cache: dict = {}
+_cache_lock = threading.Lock()
+
+
+def _summary() -> tuple[dict, list[dict]]:
+    """Returns (bounds, per-logical-index rows), recomputed only when a new
+    snapshot has been taken."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_LATEST_SQL)
+            latest = cur.fetchone()["latest"]
+            with _cache_lock:
+                if _cache.get("latest") == latest:
+                    return _cache["bounds"], _cache["rows"]
+                cur.execute(_BOUNDS_SQL)
+                bounds = dict(cur.fetchone())
+                cur.execute("SET work_mem = '256MB'")
+                cur.execute(_SUMMARY_SQL)
+                rows = [dict(r) for r in cur.fetchall()]
+                for r in rows:
+                    r["family"] = _family(r["relname"])
+                    r["band"] = _band(r["idx_scan"])
+                    r["is_dead"] = r["idx_scan"] == 0 and r["snapshots"] >= _MIN_SNAPSHOTS
+                _cache.update(latest=latest, bounds=bounds, rows=rows)
+                return bounds, rows
+
+
+def _family(relname: str) -> str:
+    return re.sub(r"_[0-9]+$", "", relname)
+
+
+def _is_analytics(row: dict) -> bool:
+    return row["relname"].startswith("analytics")
+
+
+def _band(idx_scan: int) -> str:
+    if idx_scan == 0:
+        return "dead"
+    if idx_scan < 1_000:
+        return "low"
+    if idx_scan < 10_000:
+        return "medium"
+    if idx_scan < 100_000:
+        return "high"
+    return "very_high"
 
 
 def get_overview_stats() -> dict:
-    sql = f"""
-    WITH {_BOUNDS_CTE},
-    latest AS (
-        SELECT indexrelid, relname, idx_scan
-        FROM _index_usage_daily
-        WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-    ),
-    snapshot_counts AS (
-        SELECT indexrelid, COUNT(*) AS snapshots
-        FROM _index_usage_daily
-        WHERE stats_reset = (SELECT current_reset FROM bounds)
-        GROUP BY indexrelid
-    )
-    SELECT
-        COUNT(l.*) AS total_indexes,
-        COUNT(l.*) FILTER (
-            WHERE l.idx_scan = 0 AND sc.snapshots >= 3
-        ) AS dead_count,
-        COUNT(DISTINCT regexp_replace(l.relname, '_[0-9]+$', ''))
-            FILTER (WHERE l.relname LIKE 'analytics%%') AS analytics_family_count,
-        COUNT(l.*) FILTER (
-            WHERE l.relname LIKE 'analytics%%'
-            AND l.idx_scan = 0
-            AND sc.snapshots >= 3
-        ) AS dead_analytics_count,
-        (SELECT current_reset FROM bounds) AS current_reset,
-        (SELECT latest_snap  FROM bounds) AS latest_snapshot,
-        (SELECT had_reset_flag FROM bounds) AS had_reset
-    FROM latest l
-    JOIN snapshot_counts sc ON l.indexrelid = sc.indexrelid
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return dict(cur.fetchone())
+    bounds, rows = _summary()
+    analytics = [r for r in rows if _is_analytics(r)]
+    return {
+        "total_indexes": len(rows),
+        "dead_count": sum(r["is_dead"] for r in rows),
+        "analytics_family_count": len({r["family"] for r in analytics}),
+        "dead_analytics_count": sum(r["is_dead"] for r in analytics),
+        "current_reset": bounds["current_reset"],
+        "latest_snapshot": bounds["latest_snapshot"],
+        "had_reset": bool(bounds["had_reset"]),
+    }
 
 
 def get_dead_indexes(
     analytics_only: bool = False,
 ) -> tuple[list[dict], list[dict]]:
-    analytics_filter = "AND l.relname LIKE 'analytics%%'" if analytics_only else ""
-    sql = f"""
-    WITH {_BOUNDS_CTE},
-    latest AS (
-        SELECT indexrelid, schemaname, relname, indexrelname,
-               idx_scan, index_size_bytes, stats_reset
-        FROM _index_usage_daily
-        WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-    ),
-    snapshot_counts AS (
-        SELECT indexrelid, COUNT(*) AS snapshots
-        FROM _index_usage_daily
-        WHERE stats_reset = (SELECT current_reset FROM bounds)
-        GROUP BY indexrelid
-    )
-    SELECT
-        l.schemaname,
-        l.relname,
-        l.indexrelname,
-        l.idx_scan,
-        l.index_size_bytes,
-        l.stats_reset,
-        sc.snapshots,
-        CASE WHEN sc.snapshots >= 3 THEN 'dead' ELSE 'insufficient_data' END AS classification
-    FROM latest l
-    JOIN snapshot_counts sc ON l.indexrelid = sc.indexrelid
-    WHERE l.idx_scan = 0
-    {analytics_filter}
-    ORDER BY l.index_size_bytes DESC NULLS LAST
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = [dict(r) for r in cur.fetchall()]
-    dead = [r for r in rows if r["classification"] == "dead"]
-    insufficient = [r for r in rows if r["classification"] == "insufficient_data"]
+    _, rows = _summary()
+    zero = [
+        dict(r, classification="dead" if r["is_dead"] else "insufficient_data")
+        for r in rows
+        if r["idx_scan"] == 0 and (_is_analytics(r) or not analytics_only)
+    ]
+    zero.sort(key=lambda r: r["index_size_bytes"] or 0, reverse=True)
+    dead = [r for r in zero if r["classification"] == "dead"]
+    insufficient = [r for r in zero if r["classification"] == "insufficient_data"]
     return dead, insufficient
 
 
@@ -107,139 +194,50 @@ def get_all_indexes(
         if invalid:
             raise ValueError(f"Invalid bands: {invalid}")
 
-    analytics_filter = "AND l.relname LIKE 'analytics%%'" if analytics_only else ""
-    band_filter = "WHERE band = ANY(%(bands)s)" if bands else ""
-    params: dict = {"bands": list(bands)} if bands else {}
+    _, rows = _summary()
+    result = [
+        r
+        for r in rows
+        if (not bands or r["band"] in bands) and (_is_analytics(r) or not analytics_only)
+    ]
+    result.sort(key=lambda r: r["idx_scan"])
+    return result
 
-    sql = f"""
-    WITH {_BOUNDS_CTE},
-    latest AS (
-        SELECT indexrelid, schemaname, relname, indexrelname, idx_scan, index_size_bytes
-        FROM _index_usage_daily
-        WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-    ),
-    snapshot_counts AS (
-        SELECT indexrelid, COUNT(*) AS snapshots
-        FROM _index_usage_daily
-        WHERE stats_reset = (SELECT current_reset FROM bounds)
-        GROUP BY indexrelid
-    ),
-    deltas AS (
-        SELECT
-            indexrelid,
-            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delta) AS median_delta
-        FROM (
-            SELECT
-                indexrelid,
-                idx_scan - LAG(idx_scan) OVER (
-                    PARTITION BY indexrelid ORDER BY snapshot_at
-                ) AS delta
-            FROM _index_usage_daily
-            WHERE stats_reset = (SELECT current_reset FROM bounds)
-        ) d
-        WHERE delta IS NOT NULL AND delta >= 0
-        GROUP BY indexrelid
-    ),
-    classified AS (
-        SELECT
-            l.schemaname,
-            l.relname,
-            l.indexrelname,
-            l.idx_scan,
-            COALESCE(d.median_delta, 0)::bigint AS median_delta,
-            l.index_size_bytes,
-            sc.snapshots,
-            CASE
-                WHEN l.idx_scan = 0         THEN 'dead'
-                WHEN l.idx_scan < 1000      THEN 'low'
-                WHEN l.idx_scan < 10000     THEN 'medium'
-                WHEN l.idx_scan < 100000    THEN 'high'
-                ELSE                             'very_high'
-            END AS band
-        FROM latest l
-        JOIN snapshot_counts sc ON l.indexrelid = sc.indexrelid
-        LEFT JOIN deltas d ON l.indexrelid = d.indexrelid
-        WHERE 1=1
-        {analytics_filter}
-    )
-    SELECT * FROM classified
-    {band_filter}
-    ORDER BY idx_scan ASC
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return [dict(r) for r in cur.fetchall()]
+
+def _group(rows: list[dict], key) -> list[dict]:
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(key(r), []).append(r)
+    return [
+        {
+            "key": k,
+            "partition_count": len({r["relname"] for r in g}),
+            "index_count": len(g),
+            "total_scans": sum(r["idx_scan"] for r in g),
+            "total_size_bytes": sum(r["index_size_bytes"] or 0 for r in g),
+            "dead_partition_count": sum(r["is_dead"] for r in g),
+            "fully_dead": all(r["is_dead"] for r in g),
+        }
+        for k, g in groups.items()
+    ]
 
 
 def get_analytics_families() -> list[dict]:
-    sql = f"""
-    WITH {_BOUNDS_CTE},
-    latest AS (
-        SELECT indexrelid, relname, idx_scan, index_size_bytes
-        FROM _index_usage_daily
-        WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-    ),
-    snapshot_counts AS (
-        SELECT indexrelid, COUNT(*) AS snapshots
-        FROM _index_usage_daily
-        WHERE stats_reset = (SELECT current_reset FROM bounds)
-        GROUP BY indexrelid
-    )
-    SELECT
-        regexp_replace(l.relname, '_[0-9]+$', '') AS family,
-        COUNT(*) AS partition_count,
-        SUM(l.idx_scan) AS total_scans,
-        SUM(l.index_size_bytes) AS total_size_bytes,
-        COUNT(*) FILTER (
-            WHERE l.idx_scan = 0 AND sc.snapshots >= 3
-        ) AS dead_partition_count,
-        BOOL_AND(l.idx_scan = 0 AND sc.snapshots >= 3) AS fully_dead
-    FROM latest l
-    JOIN snapshot_counts sc ON l.indexrelid = sc.indexrelid
-    WHERE l.relname LIKE 'analytics%%'
-    GROUP BY regexp_replace(l.relname, '_[0-9]+$', '')
-    ORDER BY SUM(l.idx_scan) ASC
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return [dict(r) for r in cur.fetchall()]
+    _, rows = _summary()
+    families = _group([r for r in rows if _is_analytics(r)], lambda r: r["family"])
+    for f in families:
+        f["family"] = f.pop("key")
+    families.sort(key=lambda f: f["total_scans"])
+    return families
 
 
 def get_analytics_index_family_summary(table_family: str) -> list[dict]:
-    sql = f"""
-    WITH {_BOUNDS_CTE},
-    latest AS (
-        SELECT indexrelid, relname, indexrelname, idx_scan, index_size_bytes
-        FROM _index_usage_daily
-        WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-    ),
-    snapshot_counts AS (
-        SELECT indexrelid, COUNT(*) AS snapshots
-        FROM _index_usage_daily
-        WHERE stats_reset = (SELECT current_reset FROM bounds)
-        GROUP BY indexrelid
-    )
-    SELECT
-        regexp_replace(l.indexrelname, '_ax_.*$', '') AS index_family,
-        COUNT(*)                                           AS partition_count,
-        SUM(l.index_size_bytes)                           AS total_size_bytes,
-        SUM(l.idx_scan)                                   AS total_scans,
-        COUNT(*) FILTER (
-            WHERE l.idx_scan = 0 AND sc.snapshots >= 3
-        )                                                  AS dead_partition_count,
-        BOOL_AND(l.idx_scan = 0 AND sc.snapshots >= 3)   AS fully_dead
-    FROM latest l
-    JOIN snapshot_counts sc ON l.indexrelid = sc.indexrelid
-    WHERE regexp_replace(l.relname, '_[0-9]+$', '') = %(family)s
-    GROUP BY regexp_replace(l.indexrelname, '_ax_.*$', '')
-    ORDER BY SUM(l.index_size_bytes) DESC NULLS LAST
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, {"family": table_family})
-            return [dict(r) for r in cur.fetchall()]
+    _, rows = _summary()
+    groups = _group([r for r in rows if r["family"] == table_family], lambda r: r["index_key"])
+    for g in groups:
+        g["index_family"] = g.pop("key")
+    groups.sort(key=lambda g: g["total_size_bytes"], reverse=True)
+    return groups
 
 
 def _format_cardinality(n_distinct) -> tuple[str, int]:
@@ -253,86 +251,27 @@ def _format_cardinality(n_distinct) -> tuple[str, int]:
     return str(n), n
 
 
+_CARDINALITY_SQL = """
+SELECT tablename, attname, n_distinct
+FROM pg_stats
+WHERE tablename = ANY(%(tables)s)
+"""
+
+
 def get_analytics_family_detail(family: str) -> list[dict]:
-    sql = f"""
-    WITH {_BOUNDS_CTE},
-    latest AS (
-        SELECT indexrelid, schemaname, relname, indexrelname, idx_scan, index_size_bytes
-        FROM _index_usage_daily
-        WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-    ),
-    snapshot_counts AS (
-        SELECT indexrelid, COUNT(*) AS snapshots
-        FROM _index_usage_daily
-        WHERE stats_reset = (SELECT current_reset FROM bounds)
-        GROUP BY indexrelid
-    ),
-    deltas AS (
-        SELECT
-            indexrelid,
-            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delta) AS median_delta
-        FROM (
-            SELECT
-                indexrelid,
-                idx_scan - LAG(idx_scan) OVER (
-                    PARTITION BY indexrelid ORDER BY snapshot_at
-                ) AS delta
-            FROM _index_usage_daily
-            WHERE stats_reset = (SELECT current_reset FROM bounds)
-        ) d
-        WHERE delta IS NOT NULL AND delta >= 0
-        GROUP BY indexrelid
-    ),
-    had_reset_per_index AS (
-        SELECT indexrelid, COUNT(DISTINCT stats_reset) > 1 AS had_reset
-        FROM _index_usage_daily
-        GROUP BY indexrelid
-    ),
-    index_cardinality AS (
-        SELECT
-            snap.indexrelid,
-            ps.n_distinct
-        FROM (
-            SELECT DISTINCT indexrelid, relname, indexrelname
-            FROM _index_usage_daily
-            WHERE snapshot_at = (SELECT latest_snap FROM bounds)
-              AND regexp_replace(relname, '_[0-9]+$', '') = %(family)s
-        ) snap
-        LEFT JOIN pg_stats ps
-            ON ps.tablename = snap.relname
-           AND ps.attname = regexp_replace(snap.indexrelname, '^in_(.+)_ax_.*$', '\1')
-    )
-    SELECT
-        l.schemaname,
-        l.relname,
-        l.indexrelname,
-        l.idx_scan,
-        COALESCE(d.median_delta, 0)::bigint AS median_delta,
-        l.index_size_bytes,
-        sc.snapshots,
-        CASE
-            WHEN l.idx_scan = 0         THEN 'dead'
-            WHEN l.idx_scan < 1000      THEN 'low'
-            WHEN l.idx_scan < 10000     THEN 'medium'
-            WHEN l.idx_scan < 100000    THEN 'high'
-            ELSE                             'very_high'
-        END AS band,
-        COALESCE(hr.had_reset, false) AS had_reset,
-        ic.n_distinct
-    FROM latest l
-    JOIN snapshot_counts sc ON l.indexrelid = sc.indexrelid
-    LEFT JOIN deltas d ON l.indexrelid = d.indexrelid
-    LEFT JOIN had_reset_per_index hr ON l.indexrelid = hr.indexrelid
-    LEFT JOIN index_cardinality ic ON l.indexrelid = ic.indexrelid
-    WHERE regexp_replace(l.relname, '_[0-9]+$', '') = %(family)s
-    ORDER BY l.index_size_bytes DESC NULLS LAST
-    """
+    _, rows = _summary()
+    detail = [dict(r) for r in rows if r["family"] == family]
+    if not detail:
+        return []
+
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, {"family": family})
-            rows = [dict(r) for r in cur.fetchall()]
-    for r in rows:
-        display, sort_val = _format_cardinality(r.pop("n_distinct"))
+            cur.execute(_CARDINALITY_SQL, {"tables": sorted({r["relname"] for r in detail})})
+            stats = {(s["tablename"], s["attname"]): s["n_distinct"] for s in cur.fetchall()}
+
+    for r in detail:
+        display, sort_val = _format_cardinality(stats.get((r["relname"], r["index_key"])))
         r["cardinality"] = display
         r["cardinality_sort"] = sort_val
-    return rows
+    detail.sort(key=lambda r: r["index_size_bytes"] or 0, reverse=True)
+    return detail

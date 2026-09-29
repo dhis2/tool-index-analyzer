@@ -35,7 +35,7 @@
         <th>Index</th>
         <th>Band</th>
         <th class="text-end">Scans</th>
-        <th class="text-end">Median &Delta;</th>
+        <th class="text-end">Avg &Delta;/snapshot</th>
         <th class="text-end">Size</th>
         <th class="text-end">Snapshots</th>
       </tr>
@@ -55,7 +55,7 @@
         <td><code>{{ row.indexrelname }}</code></td>
         <td><span class="badge bg-{{ band_class }}">{{ row.band | replace('_', ' ') }}</span></td>
         <td class="text-end">{{ row.idx_scan | format_number }}</td>
-        <td class="text-end">{{ row.median_delta | format_number }}</td>
+        <td class="text-end">{{ row.avg_delta | format_number }}</td>
         <td class="text-end">{{ row.index_size_bytes | format_bytes }}</td>
         <td class="text-end">{{ row.snapshots }}</td>
       </tr>

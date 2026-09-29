@@ -22,7 +22,7 @@
         <th>Index</th>
         <th class="text-end">Size</th>
         <th class="text-end">Snapshots</th>
-        <th>Stats Reset</th>
+        <th>First Seen</th>
       </tr>
     </thead>
     <tbody>
@@ -33,7 +33,7 @@
         <td><code>{{ row.indexrelname }}</code></td>
         <td class="text-end">{{ row.index_size_bytes | format_bytes }}</td>
         <td class="text-end">{{ row.snapshots }}</td>
-        <td>{{ row.stats_reset.strftime('%Y-%m-%d') }}</td>
+        <td>{{ row.first_seen.strftime('%Y-%m-%d') }}</td>
       </tr>
     {% endfor %}
     </tbody>
@@ -44,7 +44,7 @@
 {% endif %}
 
 <h5 class="mt-4">Insufficient Data <span class="badge bg-secondary">{{ insufficient | length }}</span></h5>
-<p class="text-muted small">Zero scans but fewer than 3 snapshots in current window — cannot confirm dead status.</p>
+<p class="text-muted small">Zero scans but fewer than 3 snapshots — cannot confirm dead status.</p>
 {% if insufficient %}
 <div class="table-responsive">
   <table class="table table-sm table-hover table-bordered">

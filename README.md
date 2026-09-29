@@ -50,7 +50,7 @@ Example `/etc/cron.d/index-usage-snapshot` entry (snapshot at 00:00 and 12:00, a
 
 To use the least-privilege **collector** role instead (see [Database users](#database-users-least-privilege)), run as that user with a `~/.pgpass` entry. Never use the app's read-only `DATABASE_URL`, which cannot `INSERT`.
 
-An index needs **at least 3 snapshots** in the current stats window before it can be classified as dead, so the dashboard is most useful after a few days of collection.
+An index needs **at least 3 snapshots** before it can be classified as dead, so the dashboard is most useful after a few days of collection.
 
 ## Requirements
 
@@ -177,9 +177,9 @@ sudo systemctl restart tool-index-analyzer
 
 | Route | Purpose |
 |---|---|
-| `/` | Overview: total indexes, dead count, analytics families, current stats window, reset warning |
+| `/` | Overview: total indexes, dead count, analytics families, latest snapshot and stats reset |
 | `/dead` | All zero-scan indexes with enough data to be confident they're dead (plus an "insufficient data" section). Optional analytics-only filter |
-| `/indexes` | Every index with its usage band, scan count, median delta, and size. Filter by band and analytics-only |
+| `/indexes` | Every index with its usage band, scan count (accumulated across resets and analytics rebuilds), average scans per snapshot, and size. Filter by band and analytics-only |
 | `/analytics` | One row per analytics table family, with dead-partition counts and a "fully dead" flag |
 | `/analytics/{family}` | Per-partition index detail for a single analytics family |
 
@@ -187,8 +187,9 @@ sudo systemctl restart tool-index-analyzer
 
 | Term | Meaning |
 |---|---|
-| **Current stats window** | Rows since the most recent `stats_reset`. All metrics are computed within this window |
-| **Dead** | `idx_scan = 0` in the current window **and** at least 3 snapshots exist |
+| **Logical index** | One index followed across analytics rebuilds: (table, indexed column(s)) for analytics tables, (table, index name) otherwise |
+| **Scans** | Accumulated over the whole history, across stats resets and analytics rebuilds |
+| **Dead** | 0 accumulated scans **and** at least 3 snapshots, for an index present in the latest snapshot |
 | **Insufficient data** | `idx_scan = 0` but fewer than 3 snapshots — not yet classified dead |
 | **Usage bands** | dead = 0, low = 1–999, medium = 1,000–9,999, high = 10,000–99,999, very high = 100,000+ |
 

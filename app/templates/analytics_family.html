@@ -9,13 +9,13 @@
 <h2 class="mb-3">{{ family }}</h2>
 
 {% if index_families %}
-<h5 class="mb-2">By Index Family</h5>
+<h5 class="mb-2">By Indexed Column</h5>
 <p class="text-muted small">Each row is one logical index aggregated across all year-partitions of this table family.</p>
 <div class="table-responsive mb-5">
   <table id="family-table" class="table table-sm table-hover table-bordered">
     <thead class="table-dark">
       <tr>
-        <th data-sort="str">Index Family <span class="sort-icon"></span></th>
+        <th data-sort="str">Indexed Column(s) <span class="sort-icon"></span></th>
         <th data-sort="num" class="text-end">Partitions <span class="sort-icon"></span></th>
         <th data-sort="num" class="text-end">Total Size <span class="sort-icon">▼</span></th>
         <th data-sort="num" class="text-end">Total Scans <span class="sort-icon"></span></th>
@@ -90,7 +90,7 @@
         <th data-sort="str">Index <span class="sort-icon"></span></th>
         <th data-sort="num">Band <span class="sort-icon"></span></th>
         <th data-sort="num" class="text-end">Scans <span class="sort-icon"></span></th>
-        <th data-sort="num" class="text-end">Median &Delta; <span class="sort-icon"></span></th>
+        <th data-sort="num" class="text-end">Avg &Delta;/snapshot <span class="sort-icon"></span></th>
         <th data-sort="num" class="text-end">Size <span class="sort-icon">▼</span></th>
         <th data-sort="num" class="text-end">Snapshots <span class="sort-icon"></span></th>
         <th data-sort="num">Reset? <span class="sort-icon"></span></th>
@@ -112,7 +112,7 @@
         <td><code>{{ row.indexrelname }}</code></td>
         <td data-value="{{ band_rank }}"><span class="badge bg-{{ band_class }}">{{ row.band | replace('_', ' ') }}</span></td>
         <td class="text-end" data-value="{{ row.idx_scan }}">{{ row.idx_scan | format_number }}</td>
-        <td class="text-end" data-value="{{ row.median_delta }}">{{ row.median_delta | format_number }}</td>
+        <td class="text-end" data-value="{{ row.avg_delta }}">{{ row.avg_delta | format_number }}</td>
         <td class="text-end" data-value="{{ row.index_size_bytes or 0 }}">{{ row.index_size_bytes | format_bytes }}</td>
         <td class="text-end" data-value="{{ row.snapshots }}">{{ row.snapshots }}</td>
         <td data-value="{{ '1' if row.had_reset else '0' }}">{% if row.had_reset %}<span class="badge bg-warning text-dark">Yes</span>{% else %}—{% endif %}</td>
